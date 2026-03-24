@@ -27,27 +27,79 @@ const ALL_RESOURCES = [
  * Main orchestrator — runs the clone process for selected resources.
  */
 export async function runClone(config) {
-  const { sourceShop, sourceToken, targetShop, targetToken, options } = config;
+  const { authMethod, sourceShop, targetShop, options } = config;
 
   logger.setVerbose(options.verbose);
 
-  // Validate configuration
-  if (!sourceShop || !sourceToken) {
-    throw new Error('Missing source store credentials. Set SOURCE_SHOP and SOURCE_ACCESS_TOKEN in .env');
+  // Validate store domains
+  if (!sourceShop) {
+    throw new Error('Missing SOURCE_SHOP in .env (e.g. my-store.myshopify.com)');
   }
-  if (!targetShop || !targetToken) {
-    throw new Error('Missing target store credentials. Set TARGET_SHOP and TARGET_ACCESS_TOKEN in .env');
+  if (!targetShop) {
+    throw new Error('Missing TARGET_SHOP in .env (e.g. my-dev-store.myshopify.com)');
   }
 
-  // Initialize API clients
-  const sourceApi = new ShopifyClient(sourceShop, sourceToken);
-  const targetApi = new ShopifyClient(targetShop, targetToken);
+  // Build API clients based on auth method
+  let sourceApi, targetApi;
+
+  if (authMethod === 'client_credentials') {
+    if (!config.sourceClientId || !config.sourceClientSecret) {
+      throw new Error(
+        'Missing source store credentials.\n' +
+        'Set SOURCE_CLIENT_ID and SOURCE_CLIENT_SECRET in .env\n' +
+        '(from Dev Dashboard > Your Source App > Settings)'
+      );
+    }
+    if (!config.targetClientId || !config.targetClientSecret) {
+      throw new Error(
+        'Missing target store credentials.\n' +
+        'Set TARGET_CLIENT_ID and TARGET_CLIENT_SECRET in .env\n' +
+        '(from Dev Dashboard > Your Target App > Settings)'
+      );
+    }
+
+    sourceApi = new ShopifyClient({
+      shop: sourceShop,
+      clientId: config.sourceClientId,
+      clientSecret: config.sourceClientSecret,
+      authMethod: 'client_credentials',
+    });
+
+    targetApi = new ShopifyClient({
+      shop: targetShop,
+      clientId: config.targetClientId,
+      clientSecret: config.targetClientSecret,
+      authMethod: 'client_credentials',
+    });
+
+  } else {
+    // Legacy static token auth
+    if (!config.sourceToken) {
+      throw new Error('Missing SOURCE_ACCESS_TOKEN in .env');
+    }
+    if (!config.targetToken) {
+      throw new Error('Missing TARGET_ACCESS_TOKEN in .env');
+    }
+
+    sourceApi = new ShopifyClient({
+      shop: sourceShop,
+      accessToken: config.sourceToken,
+      authMethod: 'static',
+    });
+
+    targetApi = new ShopifyClient({
+      shop: targetShop,
+      accessToken: config.targetToken,
+      authMethod: 'static',
+    });
+  }
 
   // Determine which resources to clone
   const resources = filterResources(ALL_RESOURCES, options);
 
   logger.divider();
-  logger.step(`Shopify Store Clone`);
+  logger.step(`Shopify Store Clone v2.0`);
+  logger.info(`Auth method: ${authMethod === 'client_credentials' ? 'Dev Dashboard (client credentials)' : 'Legacy (static token)'}`);
   logger.info(`Source: ${sourceShop}`);
   logger.info(`Target: ${targetShop}`);
   if (options.dryRun) {
@@ -55,6 +107,24 @@ export async function runClone(config) {
   }
   logger.info(`Resources: ${resources.map((r) => r.key).join(', ')}`);
   logger.divider();
+
+  // Verify connectivity by fetching a token for each store
+  if (authMethod === 'client_credentials') {
+    logger.step('Verifying API access...');
+    try {
+      await sourceApi.getAccessToken();
+      logger.success(`Source store (${sourceShop}) — connected`);
+    } catch (err) {
+      throw new Error(`Cannot connect to source store: ${err.message}`);
+    }
+    try {
+      await targetApi.getAccessToken();
+      logger.success(`Target store (${targetShop}) — connected`);
+    } catch (err) {
+      throw new Error(`Cannot connect to target store: ${err.message}`);
+    }
+    console.log('');
+  }
 
   // Note about navigation menus
   logger.warn(

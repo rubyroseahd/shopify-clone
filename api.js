@@ -5,24 +5,122 @@ const DEFAULT_API_VERSION = '2024-10';
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 1000;
 
+// Token refresh buffer — refresh 5 minutes before expiry
+const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+
 /**
- * Shopify Admin API client with automatic pagination, rate limiting, and retry logic.
+ * Shopify Admin API client with automatic pagination, rate limiting,
+ * retry logic, and support for both client credentials and static tokens.
  */
 export class ShopifyClient {
-  constructor(shop, accessToken, { apiVersion = DEFAULT_API_VERSION, concurrency = 2 } = {}) {
+  /**
+   * @param {object} config
+   * @param {string} config.shop - The myshopify.com domain (e.g. "my-store.myshopify.com")
+   * @param {string} [config.accessToken] - Static access token (legacy admin-created apps)
+   * @param {string} [config.clientId] - Client ID (Dev Dashboard apps)
+   * @param {string} [config.clientSecret] - Client secret (Dev Dashboard apps)
+   * @param {string} [config.authMethod] - "client_credentials" or "static"
+   * @param {string} [config.apiVersion] - API version (default: 2024-10)
+   * @param {number} [config.concurrency] - Max concurrent requests (default: 2)
+   */
+  constructor({ shop, accessToken, clientId, clientSecret, authMethod = 'static', apiVersion = DEFAULT_API_VERSION, concurrency = 2 }) {
     this.shop = shop;
-    this.accessToken = accessToken;
+    this.authMethod = authMethod;
     this.apiVersion = apiVersion;
     this.baseUrl = `https://${shop}/admin/api/${apiVersion}`;
     this.limit = pLimit(concurrency);
+
+    // Static token (legacy)
+    this.staticToken = accessToken || null;
+
+    // Client credentials (Dev Dashboard)
+    this.clientId = clientId || null;
+    this.clientSecret = clientSecret || null;
+
+    // Token cache for client_credentials grant
+    this._cachedToken = null;
+    this._tokenExpiresAt = null;
+  }
+
+  /**
+   * Get a valid access token. For client_credentials, fetches/refreshes automatically.
+   * For static tokens, returns the stored token directly.
+   */
+  async getAccessToken() {
+    if (this.authMethod === 'static') {
+      if (!this.staticToken) {
+        throw new Error(`No access token configured for ${this.shop}. Set the ACCESS_TOKEN in .env`);
+      }
+      return this.staticToken;
+    }
+
+    // Client credentials flow — check if we have a valid cached token
+    if (this._cachedToken && this._tokenExpiresAt) {
+      const now = Date.now();
+      if (now < this._tokenExpiresAt - TOKEN_REFRESH_BUFFER_MS) {
+        return this._cachedToken;
+      }
+      logger.verbose(`Token for ${this.shop} is expiring soon, refreshing...`);
+    }
+
+    // Fetch a new token via client_credentials grant
+    return this._fetchClientCredentialsToken();
+  }
+
+  /**
+   * Fetch a new access token using the client_credentials OAuth grant.
+   * Tokens are valid for ~24 hours (86399 seconds).
+   */
+  async _fetchClientCredentialsToken() {
+    if (!this.clientId || !this.clientSecret) {
+      throw new Error(
+        `Missing client credentials for ${this.shop}. ` +
+        `Set CLIENT_ID and CLIENT_SECRET in .env, or switch to AUTH_METHOD=static.`
+      );
+    }
+
+    const url = `https://${this.shop}/admin/oauth/access_token`;
+
+    logger.verbose(`Requesting access token for ${this.shop} via client_credentials grant...`);
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: this.clientId,
+        client_secret: this.clientSecret,
+      }).toString(),
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(
+        `Failed to get access token for ${this.shop} (HTTP ${response.status}).\n` +
+        `Response: ${text}\n\n` +
+        `Troubleshooting:\n` +
+        `  - Verify CLIENT_ID and CLIENT_SECRET are correct\n` +
+        `  - Make sure the app is installed on the store\n` +
+        `  - Check that API scopes are configured and a version is released\n` +
+        `  - See the README troubleshooting section for more help`
+      );
+    }
+
+    const data = await response.json();
+    this._cachedToken = data.access_token;
+    this._tokenExpiresAt = Date.now() + (data.expires_in || 86399) * 1000;
+
+    logger.verbose(`Got access token for ${this.shop} (expires in ${data.expires_in}s, scopes: ${data.scope})`);
+    return this._cachedToken;
   }
 
   /**
    * Build headers for Shopify API requests.
    */
-  get headers() {
+  async getHeaders() {
+    const token = await this.getAccessToken();
     return {
-      'X-Shopify-Access-Token': this.accessToken,
+      'X-Shopify-Access-Token': token,
       'Content-Type': 'application/json',
       'Accept': 'application/json',
     };
@@ -57,10 +155,8 @@ export class ShopifyClient {
     }
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      const options = {
-        method,
-        headers: this.headers,
-      };
+      const headers = await this.getHeaders();
+      const options = { method, headers };
       if (body && (method === 'POST' || method === 'PUT')) {
         options.body = JSON.stringify(body);
       }
@@ -76,6 +172,15 @@ export class ShopifyClient {
           continue;
         }
         throw new Error(`Network error after ${MAX_RETRIES + 1} attempts: ${err.message}`);
+      }
+
+      // Handle 401 — token may have expired mid-run (client_credentials)
+      if (response.status === 401 && this.authMethod === 'client_credentials' && attempt < MAX_RETRIES) {
+        logger.warn(`Got 401 Unauthorized — refreshing token (attempt ${attempt + 1})...`);
+        this._cachedToken = null;
+        this._tokenExpiresAt = null;
+        await sleep(1000);
+        continue;
       }
 
       // Handle rate limiting (429)
