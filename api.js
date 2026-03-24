@@ -22,13 +22,15 @@ export class ShopifyClient {
    * @param {string} [config.authMethod] - "client_credentials" or "static"
    * @param {string} [config.apiVersion] - API version (default: 2024-10)
    * @param {number} [config.concurrency] - Max concurrent requests (default: 2)
+   * @param {boolean} [config.readOnly] - If true, block all POST/PUT/DELETE requests (safety net for source stores)
    */
-  constructor({ shop, accessToken, clientId, clientSecret, authMethod = 'static', apiVersion = DEFAULT_API_VERSION, concurrency = 2 }) {
+  constructor({ shop, accessToken, clientId, clientSecret, authMethod = 'static', apiVersion = DEFAULT_API_VERSION, concurrency = 2, readOnly = false }) {
     this.shop = shop;
     this.authMethod = authMethod;
     this.apiVersion = apiVersion;
     this.baseUrl = `https://${shop}/admin/api/${apiVersion}`;
     this.limit = pLimit(concurrency);
+    this.readOnly = readOnly;
 
     // Static token (legacy)
     this.staticToken = accessToken || null;
@@ -228,27 +230,44 @@ export class ShopifyClient {
   }
 
   /**
-   * POST request.
+   * POST request. Blocked if client is in readOnly mode.
    */
   async post(path, body) {
+    this._enforceWritable('POST', path);
     const { data } = await this.request('POST', path, { body });
     return data;
   }
 
   /**
-   * PUT request.
+   * PUT request. Blocked if client is in readOnly mode.
    */
   async put(path, body) {
+    this._enforceWritable('PUT', path);
     const { data } = await this.request('PUT', path, { body });
     return data;
   }
 
   /**
-   * DELETE request.
+   * DELETE request. Blocked if client is in readOnly mode.
    */
   async delete(path) {
+    this._enforceWritable('DELETE', path);
     const { data } = await this.request('DELETE', path);
     return data;
+  }
+
+  /**
+   * Safety net: throws an error if a write operation is attempted on a read-only client.
+   * This prevents any accidental modification of the source store.
+   */
+  _enforceWritable(method, path) {
+    if (this.readOnly) {
+      throw new Error(
+        `SAFETY BLOCK: Attempted ${method} ${path} on read-only store ${this.shop}. ` +
+        `This is a bug — the source store should never receive write requests. ` +
+        `The operation has been blocked. Your source store is safe.`
+      );
+    }
   }
 
   /**

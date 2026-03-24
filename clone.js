@@ -1,3 +1,4 @@
+import { createInterface } from 'readline';
 import { ShopifyClient } from './api.js';
 import { logger } from './logger.js';
 
@@ -31,7 +32,7 @@ export async function runClone(config) {
 
   logger.setVerbose(options.verbose);
 
-  // Validate store domains
+  // ── Validate store domains ────────────────────────────────────────────────
   if (!sourceShop) {
     throw new Error('Missing SOURCE_SHOP in .env (e.g. my-store.myshopify.com)');
   }
@@ -39,7 +40,18 @@ export async function runClone(config) {
     throw new Error('Missing TARGET_SHOP in .env (e.g. my-dev-store.myshopify.com)');
   }
 
-  // Build API clients based on auth method
+  // ── Safety check: prevent cloning to yourself ─────────────────────────────
+  if (sourceShop.toLowerCase() === targetShop.toLowerCase()) {
+    throw new Error(
+      'SOURCE_SHOP and TARGET_SHOP are the same store. ' +
+      'This would create duplicate data on your production store. Aborting.'
+    );
+  }
+
+  // ── Build API clients ─────────────────────────────────────────────────────
+  // CRITICAL: Source client is created in READ-ONLY mode.
+  // This is a hard safety net — even if a bug in the code tried to write to the
+  // source store, the client would block it and throw an error.
   let sourceApi, targetApi;
 
   if (authMethod === 'client_credentials') {
@@ -63,6 +75,7 @@ export async function runClone(config) {
       clientId: config.sourceClientId,
       clientSecret: config.sourceClientSecret,
       authMethod: 'client_credentials',
+      readOnly: true, // ← SAFETY: source store is read-only
     });
 
     targetApi = new ShopifyClient({
@@ -73,7 +86,6 @@ export async function runClone(config) {
     });
 
   } else {
-    // Legacy static token auth
     if (!config.sourceToken) {
       throw new Error('Missing SOURCE_ACCESS_TOKEN in .env');
     }
@@ -85,6 +97,7 @@ export async function runClone(config) {
       shop: sourceShop,
       accessToken: config.sourceToken,
       authMethod: 'static',
+      readOnly: true, // ← SAFETY: source store is read-only
     });
 
     targetApi = new ShopifyClient({
@@ -97,43 +110,69 @@ export async function runClone(config) {
   // Determine which resources to clone
   const resources = filterResources(ALL_RESOURCES, options);
 
+  // ── Print header ──────────────────────────────────────────────────────────
   logger.divider();
-  logger.step(`Shopify Store Clone v2.0`);
+  logger.step('Shopify Store Clone v2.0');
   logger.info(`Auth method: ${authMethod === 'client_credentials' ? 'Dev Dashboard (client credentials)' : 'Legacy (static token)'}`);
-  logger.info(`Source: ${sourceShop}`);
-  logger.info(`Target: ${targetShop}`);
+  logger.info(`Source: ${sourceShop} (READ-ONLY — no data will be modified)`);
+  logger.info(`Target: ${targetShop} (data will be CREATED here)`);
   if (options.dryRun) {
-    logger.warn('DRY RUN — no changes will be made to the target store');
+    logger.warn('DRY RUN — no changes will be made to any store');
   }
   logger.info(`Resources: ${resources.map((r) => r.key).join(', ')}`);
   logger.divider();
 
-  // Verify connectivity by fetching a token for each store
-  if (authMethod === 'client_credentials') {
-    logger.step('Verifying API access...');
-    try {
-      await sourceApi.getAccessToken();
-      logger.success(`Source store (${sourceShop}) — connected`);
-    } catch (err) {
-      throw new Error(`Cannot connect to source store: ${err.message}`);
-    }
-    try {
-      await targetApi.getAccessToken();
-      logger.success(`Target store (${targetShop}) — connected`);
-    } catch (err) {
-      throw new Error(`Cannot connect to target store: ${err.message}`);
+  // ── Verify API connectivity ───────────────────────────────────────────────
+  logger.step('Verifying API access...');
+
+  let sourceScopes, targetScopes;
+  try {
+    const token = await sourceApi.getAccessToken();
+    // Verify by making a lightweight read call
+    await sourceApi.get('/shop.json');
+    logger.success(`Source store (${sourceShop}) — connected, read-only mode`);
+  } catch (err) {
+    throw new Error(`Cannot connect to source store (${sourceShop}): ${err.message}`);
+  }
+
+  try {
+    await targetApi.getAccessToken();
+    await targetApi.get('/shop.json');
+    logger.success(`Target store (${targetShop}) — connected`);
+  } catch (err) {
+    throw new Error(`Cannot connect to target store (${targetShop}): ${err.message}`);
+  }
+  console.log('');
+
+  // ── Pre-flight check: warn if target store already has data ───────────────
+  if (!options.dryRun) {
+    await prefightCheck(targetApi, targetShop, resources);
+  }
+
+  // ── Confirmation prompt (skip in dry-run or if --yes flag) ────────────────
+  if (!options.dryRun && !options.yes) {
+    console.log('');
+    const confirmed = await promptConfirmation(
+      `Ready to clone data from ${sourceShop} → ${targetShop}.\n` +
+      `  This will CREATE new data on ${targetShop}.\n` +
+      `  The source store (${sourceShop}) will NOT be modified.\n` +
+      `  Continue? (y/N): `
+    );
+    if (!confirmed) {
+      logger.warn('Clone cancelled by user.');
+      return;
     }
     console.log('');
   }
 
-  // Note about navigation menus
+  // Navigation menus note
   logger.warn(
     'Navigation menus are not available via the REST Admin API and will not be cloned. ' +
     'You will need to recreate them manually in the target store admin.'
   );
   console.log('');
 
-  // Run each resource clone sequentially (to respect dependencies)
+  // ── Run each resource clone sequentially ──────────────────────────────────
   const results = [];
 
   for (const resource of ALL_RESOURCES) {
@@ -161,11 +200,84 @@ export async function runClone(config) {
   // Print summary
   logger.summary(results);
 
-  // Check for any failures
   const failures = results.filter((r) => r.error);
   if (failures.length > 0) {
     process.exitCode = 1;
   }
+}
+
+/**
+ * Check if the target store already has data and warn the user.
+ * This prevents accidentally duplicating data on a store that was already cloned to.
+ */
+async function prefightCheck(targetApi, targetShop, selectedResources) {
+  logger.step('Pre-flight check: scanning target store for existing data...');
+
+  const warnings = [];
+  const selectedKeys = selectedResources.map((r) => r.key);
+
+  try {
+    if (selectedKeys.includes('products')) {
+      const { data } = await targetApi.get('/products/count.json');
+      if (data.count > 0) {
+        warnings.push(`  Products: ${data.count} already exist — cloning will create duplicates`);
+      }
+    }
+
+    if (selectedKeys.includes('pages')) {
+      const { data } = await targetApi.get('/pages/count.json');
+      if (data.count > 0) {
+        warnings.push(`  Pages: ${data.count} already exist — cloning will create duplicates`);
+      }
+    }
+
+    if (selectedKeys.includes('collections')) {
+      const { data: cc } = await targetApi.get('/custom_collections/count.json');
+      const { data: sc } = await targetApi.get('/smart_collections/count.json');
+      const total = (cc.count || 0) + (sc.count || 0);
+      if (total > 0) {
+        warnings.push(`  Collections: ${total} already exist — cloning will create duplicates`);
+      }
+    }
+
+    if (selectedKeys.includes('redirects')) {
+      const { data } = await targetApi.get('/redirects/count.json');
+      if (data.count > 0) {
+        warnings.push(`  Redirects: ${data.count} already exist — cloning may create conflicts`);
+      }
+    }
+  } catch {
+    // If count endpoints fail, skip pre-flight (non-critical)
+    logger.verbose('Pre-flight count check failed for some resources (non-critical)');
+  }
+
+  if (warnings.length > 0) {
+    logger.warn(`Target store (${targetShop}) already has data:`);
+    for (const w of warnings) {
+      console.log(w);
+    }
+    logger.warn('Running the clone again will create DUPLICATE items. Consider using --skip or clearing the target store first.');
+  } else {
+    logger.success('Target store looks clean — no existing data detected for selected resources');
+  }
+}
+
+/**
+ * Prompt the user for confirmation. Returns true if they type 'y' or 'yes'.
+ */
+function promptConfirmation(message) {
+  return new Promise((resolve) => {
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    rl.question(message, (answer) => {
+      rl.close();
+      const normalized = (answer || '').trim().toLowerCase();
+      resolve(normalized === 'y' || normalized === 'yes');
+    });
+  });
 }
 
 /**

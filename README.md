@@ -7,6 +7,7 @@ A Node.js CLI tool that clones data from a production Shopify store to a develop
 ## Table of Contents
 
 - [What It Does](#what-it-does)
+- [Source Store Safety](#source-store-safety)
 - [Prerequisites](#prerequisites)
 - [Step-by-Step Setup](#step-by-step-setup)
   - [Step 1: Install Node.js](#step-1-install-nodejs)
@@ -21,6 +22,7 @@ A Node.js CLI tool that clones data from a production Shopify store to a develop
 - [Usage Examples](#usage-examples)
 - [Resources Cloned](#resources-cloned)
 - [How It Works](#how-it-works)
+- [How Matrixify and Other Apps Do It](#how-matrixify-and-other-apps-do-it)
 - [Legacy Auth (Admin-Created Custom Apps)](#legacy-auth-admin-created-custom-apps)
 - [Troubleshooting](#troubleshooting)
 - [Known Limitations](#known-limitations)
@@ -30,6 +32,85 @@ A Node.js CLI tool that clones data from a production Shopify store to a develop
 ## What It Does
 
 `shopify-clone` reads resources from a **source** Shopify store (your production store) and recreates them on a **target** store (your development store). This is useful for setting up staging environments with real production data for app testing.
+
+---
+
+## Source Store Safety
+
+Your production store will **never be modified** by this tool. Here's why:
+
+### Layer 1: Read-Only API Scopes
+
+The source app only needs **read** scopes (`read_products`, `read_content`, etc.). It literally does not have permission to write data. Even if the tool tried, Shopify's API would reject the request with a 403 Forbidden.
+
+**Recommendation:** When creating the source app in the Dev Dashboard, only grant `read_*` scopes — never `write_*`. This is your first line of defense enforced by Shopify itself.
+
+### Layer 2: Read-Only Client Lock
+
+The source store's API client is initialized in **read-only mode** at the code level. The `post()`, `put()`, and `delete()` methods are hard-blocked on the source client. If any code path ever attempted a write operation on the source store (which none do), the tool would immediately throw an error:
+
+```
+SAFETY BLOCK: Attempted POST /products.json on read-only store my-store.myshopify.com.
+This is a bug — the source store should never receive write requests.
+The operation has been blocked. Your source store is safe.
+```
+
+This is a defense-in-depth measure — the code already never writes to source, but the lock guarantees it.
+
+### Layer 3: Same-Store Prevention
+
+If `SOURCE_SHOP` and `TARGET_SHOP` are accidentally set to the same domain, the tool refuses to start:
+
+```
+Error: SOURCE_SHOP and TARGET_SHOP are the same store.
+This would create duplicate data on your production store. Aborting.
+```
+
+### Layer 4: Confirmation Prompt
+
+Before any data is written, the tool shows a confirmation prompt:
+
+```
+Ready to clone data from my-store.myshopify.com → my-dev-store.myshopify.com.
+  This will CREATE new data on my-dev-store.myshopify.com.
+  The source store (my-store.myshopify.com) will NOT be modified.
+  Continue? (y/N):
+```
+
+You must type `y` to proceed. Use `--dry-run` to preview without writing anything at all.
+
+### Layer 5: Target Store Pre-Flight Check
+
+Before cloning, the tool checks if the target store already has data (products, pages, collections, redirects). If it does, you get a warning:
+
+```
+⚠ Target store (my-dev-store.myshopify.com) already has data:
+  Products: 142 already exist — cloning will create duplicates
+  Pages: 5 already exist — cloning will create duplicates
+⚠ Running the clone again will create DUPLICATE items.
+  Consider using --skip or clearing the target store first.
+```
+
+This prevents you from accidentally running the clone twice and ending up with duplicate products.
+
+### What the Tool Does to Each Store
+
+| Action | Source Store | Target Store |
+|---|---|---|
+| Read products, pages, themes, etc. | Yes (GET only) | No |
+| Create products, pages, themes, etc. | **Never** | Yes |
+| Update existing data | **Never** | **Never** |
+| Delete data | **Never** | **Never** |
+| Modify settings, payments, etc. | **Never** | **Never** |
+
+### Side Effects on the Source Store
+
+The only interaction with your source store is **reading data via API GET requests**. This has minimal side effects:
+
+- **Rate limit usage:** The tool makes GET requests at a controlled rate (max 2/second). This counts against your source store's API rate limit bucket (40 requests for standard plans). If you have other apps making heavy API calls simultaneously, they could collectively hit the rate limit and experience brief throttling. This is temporary and resolves within seconds.
+- **No data changes:** GET requests do not create, modify, or delete any store data. They are the equivalent of viewing your store admin — just reading information.
+- **No webhooks triggered:** Reading data does not trigger any webhook events on your source store.
+- **No customer notifications:** No emails, SMS, or notifications are sent.
 
 ---
 
@@ -218,10 +299,10 @@ You'll see a progress log and a summary at the end.
 ## Usage Examples
 
 ```bash
-# Clone everything
+# Clone everything (with confirmation prompt)
 node bin/clone.js
 
-# Dry run — preview without making changes
+# Dry run — preview without making changes (RECOMMENDED for first run)
 node bin/clone.js --dry-run
 
 # Clone only products and pages
@@ -232,6 +313,9 @@ node bin/clone.js --skip theme
 
 # Verbose output with only collections
 node bin/clone.js --only collections --verbose
+
+# Skip the confirmation prompt (for scripted/automated use)
+node bin/clone.js --yes
 
 # Combine flags
 node bin/clone.js --only products,collections --dry-run --verbose
@@ -261,12 +345,33 @@ node bin/clone.js --only products,collections --dry-run --verbose
 ## How It Works
 
 1. The tool authenticates with both stores using the **client credentials grant** (OAuth 2.0). Tokens are valid for ~24 hours and are automatically refreshed.
-2. Resources are cloned **sequentially in dependency order** (e.g., products before collections, so product-collection associations work correctly).
-3. API calls are limited to **2 concurrent requests** to stay within Shopify rate limits.
-4. **Automatic retry with exponential backoff** handles 429 (rate limited) and 5xx (server error) responses.
-5. The `Retry-After` header is respected when present.
-6. Errors on individual items are logged but **don't stop** the overall process.
-7. A summary table is printed at the end showing success/failure per resource.
+2. **Pre-flight checks** verify connectivity, detect existing data on the target, and ask for confirmation.
+3. Resources are cloned **sequentially in dependency order** (e.g., products before collections, so product-collection associations work correctly).
+4. API calls are limited to **2 concurrent requests** to stay within Shopify rate limits.
+5. **Automatic retry with exponential backoff** handles 429 (rate limited) and 5xx (server error) responses.
+6. The `Retry-After` header is respected when present.
+7. Errors on individual items are logged but **don't stop** the overall process.
+8. A summary table is printed at the end showing success/failure per resource.
+
+---
+
+## How Matrixify and Other Apps Do It
+
+Matrixify (formerly Excelify), Rewind Staging, and similar tools use the same underlying approach:
+
+1. **Export phase:** They read data from the source store using Shopify's Admin API (the same API this tool uses). Matrixify exports to Excel/CSV files; this tool reads directly via API.
+2. **Import phase:** They write data to the target store using Shopify's Admin API. Matrixify imports from spreadsheet files; this tool creates resources directly via API.
+
+The key similarities:
+- All tools use the same Shopify API — there is no special "clone" API. It's always read from source, write to target.
+- All tools require API access (scopes/permissions) to both stores.
+- None of them modify the source store — they only read from it.
+
+The key difference with this tool:
+- **No ongoing subscription fee.** Matrixify charges $20-200/month. This tool is free.
+- **You control the code.** You can audit exactly what it does, modify it, or extend it.
+- **Matrixify can export to files** (useful as backups). This tool clones directly store-to-store.
+- **Matrixify supports more data types** (navigation menus, metaobject entries, discount codes). This tool covers the most common resources.
 
 ---
 
