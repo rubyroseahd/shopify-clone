@@ -1,0 +1,28 @@
+{
+  "name": "shopify-clone",
+  "version": "1.0.0",
+  "description": "Clone data from a production Shopify store to a development store",
+  "type": "module",
+  "bin": {
+    "shopify-clone": "./bin/clone.js"
+  },
+  "scripts": {
+    "start": "node bin/clone.js"
+  },
+  "keywords": [
+    "shopify",
+    "clone",
+    "migration",
+    "development"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "p-limit": "^6.1.0"
+  }
+}
